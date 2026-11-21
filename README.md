@@ -1,103 +1,150 @@
-# Linux Disk Usage Monitor
+# Linux System Health Monitor
 
-A simple Bash script that checks root (`/`) disk usage, logs the result with a timestamp, and runs automatically every minute using cron.
+A Bash script that checks disk, RAM and CPU load on a Linux machine, logs every check with a timestamp, raises an alert when a limit is crossed, and runs automatically every minute with cron.
 
 ## Features
-- Reads disk usage of `/` using `df`, `grep`, `awk` and `sed`
-- Prints a **WARNING** when usage is 80% or more, otherwise **OK**
-- Adds a timestamp to every entry
-- Appends results to `monitor.log`
-- Runs automatically through a cron job
+- Monitors root disk usage, RAM usage and CPU load
+- Configurable thresholds (default 80% for each)
+- One timestamped log line per check
+- Alerts name the exact metric, its value and the limit
+- Alerts go to a separate alert file and to the system log
+- Runs automatically through cron
 
 ## Tech Used
-Bash · Linux (Ubuntu) · cron · df / grep / awk / sed
+Bash · Ubuntu · cron · df, free, uptime, nproc · grep, awk, sed · logger, journalctl
 
-## How It Works
+## How the Numbers Are Collected
 
-### 1. Get the disk usage line
+### Disk usage
 ```bash
 df -h | grep " /$"
 ```
 ![df output](images/02-df-output.png)
 
-### 2. Extract the usage column
 ```bash
 df -h | grep " /$" | awk '{print $5}'
 ```
 ![awk](images/03-awk-filter.png)
 
-### 3. Remove the `%` sign
 ```bash
 df -h | grep " /$" | awk '{print $5}' | sed 's/%//g'
 ```
 ![sed](images/04-sed-clean.png)
+
+### RAM usage
+Percentage of total memory that is not available:
+```bash
+free -m | awk '/Mem:/ {printf "%d", ($2-$7)/$2*100}'
+```
+
+### CPU load
+The 1-minute load average divided by the number of CPU cores, as a percentage (it can go above 100% on a heavily loaded machine):
+```bash
+uptime | awk -F'load average:' '{print $2}' | cut -d, -f1
+nproc
+```
 
 ## The Script
 
 ```bash
 #!/bin/bash
 
+LOG_FILE="/home/noebl/monitor.log"
+ALERT_FILE="/home/noebl/alerts.log"
+DISK_THRESHOLD=80
+RAM_THRESHOLD=80
+CPU_THRESHOLD=80
+
 TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
 
-# Capture disk usage (number only) into a variable
+# Disk: percentage used on /
 DISK_USAGE=$(df -h | grep " /$" | awk '{print $5}' | sed 's/%//g')
 
-if [ "$DISK_USAGE" -ge 80 ]; then
-    echo "[$TIMESTAMP] WARNING: Disk usage is full at $DISK_USAGE%." >> monitor.log
-else
-    echo "[$TIMESTAMP] OK : Disk usage is healthy at $DISK_USAGE%." >> monitor.log
+# RAM: percentage used, based on the "available" column of free -m
+RAM_USAGE=$(free -m | awk '/Mem:/ {printf "%d", ($2-$7)/$2*100}')
+
+# CPU: 1-minute load average as a percentage of the number of cores
+LOAD=$(uptime | awk -F'load average:' '{print $2}' | cut -d, -f1 | xargs)
+CORES=$(nproc)
+CPU_USAGE=$(awk -v l="$LOAD" -v c="$CORES" 'BEGIN {printf "%d", l/c*100}')
+
+STATUS="OK"
+ALERTS=""
+
+if [ "$DISK_USAGE" -ge "$DISK_THRESHOLD" ]; then
+    STATUS="WARNING"
+    ALERTS="$ALERTS Disk at ${DISK_USAGE}% (limit ${DISK_THRESHOLD}%)."
+fi
+
+if [ "$RAM_USAGE" -ge "$RAM_THRESHOLD" ]; then
+    STATUS="WARNING"
+    ALERTS="$ALERTS RAM at ${RAM_USAGE}% (limit ${RAM_THRESHOLD}%)."
+fi
+
+if [ "$CPU_USAGE" -ge "$CPU_THRESHOLD" ]; then
+    STATUS="WARNING"
+    ALERTS="$ALERTS CPU load at ${CPU_USAGE}% (limit ${CPU_THRESHOLD}%)."
+fi
+
+echo "[$TIMESTAMP] $STATUS | Disk: ${DISK_USAGE}% | RAM: ${RAM_USAGE}% | CPU load: ${CPU_USAGE}%" >> "$LOG_FILE"
+
+if [ "$STATUS" = "WARNING" ]; then
+    echo "[$TIMESTAMP] ALERT:$ALERTS" >> "$ALERT_FILE"
+    logger -p user.warning -t disk-monitor "ALERT:$ALERTS"
 fi
 ```
-![script](images/01-script.png)
+
+## Configuration
+Edit the variables at the top of `monitor.sh`:
+- `LOG_FILE` and `ALERT_FILE`: use absolute paths (change `/home/noebl` to your own home folder)
+- `DISK_THRESHOLD`, `RAM_THRESHOLD`, `CPU_THRESHOLD`: the percentage that triggers a warning
 
 ## Usage
-
 ```bash
 chmod +x monitor.sh
 ./monitor.sh
-cat monitor.log
+tail -n 3 /home/noebl/monitor.log
 ```
-![manual run](images/05-manual-run.png)
 
 ## Automating with Cron
-
 ```bash
 crontab -e
 ```
 Add this line to run the script every minute:
 ```
-* * * * * /home/noebl/monitor.sh
+* * * * * /home/noebl/Linux-Disk-Monitor/monitor.sh
 ```
-Verify with:
+Use an absolute path, because cron does not start in your project folder. Verify with `crontab -l`.
+
+## Example Output
+
+Log lines (the WARNING was forced by temporarily lowering a threshold to test the alert path):
+```
+[2026-11-21 14:04:01] WARNING | Disk: 44% | RAM: 41% | CPU load: 3%
+[2026-11-21 14:04:57] OK | Disk: 44% | RAM: 41% | CPU load: 9%
+[2026-11-21 14:05:01] OK | Disk: 44% | RAM: 41% | CPU load: 9%
+```
+![warning test](images/10-warning-test.png)
+
+Alert file and system log:
+```
+[2026-11-21 14:18:23] ALERT: Disk at 44% (limit 1%).
+```
+![alerts](images/11-alerts-test.png)
+
+View system log alerts with:
 ```bash
-crontab -l
+journalctl -t disk-monitor
 ```
-![crontab](images/06-crontab.png)
-
-## Result
-The log fills up automatically, one entry per minute:
-
-![log](images/07-log-output.png)
-
-## Other Commands Explored
-| Command | Purpose |
-|---|---|
-| `uptime` | System load average |
-| `free -m` | RAM usage in MB |
-| `pwd` | Find absolute path for cron |
-
-![uptime](images/08-uptime.png)
-![free](images/09-free.png)
 
 ## What I Learned
-- Chaining commands with pipes
-- Capturing command output in variables
-- Conditional logic in Bash
-- Redirecting output with `>>`
-- Scheduling tasks with cron and why cron needs absolute paths
+- Chaining commands with pipes and capturing output in variables
+- Conditional logic and multiple checks in Bash
+- Scheduling with cron and why it needs absolute paths
+- Writing to the system log with `logger`
+- Testing a script by forcing its warning path, then verifying each number against the real tools
 
 ## Future Improvements
-- Add CPU load and RAM checks to the script
-- Send an email or alert on WARNING
-- Use an absolute path for the log file
-- Rotate old logs
+- Log rotation so `monitor.log` doesn't grow forever
+- Email or chat notifications on alerts
+- Move the thresholds into a separate config file
